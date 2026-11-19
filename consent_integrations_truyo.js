@@ -4,6 +4,12 @@
  * @module utcm/integration
  * @description CMP-specific component for Truyo.
  *
+ * 1.2.0
+ *  - Sets tealiumCmpIntegration.tiqGroupName ('necessary') to prevent framework blocking.
+ *  - Handles implicit consent for US/Opt-out visitors when LocalStorage is empty.
+ *  - Reads window.truyoConfig (from interim pre-loader or future native loader).
+ *  - Listens for `truyoGeoResolved` to trigger immediate rechecks.
+ *
  * 1.0.0
  *  - Initial version for Truyo consent integration.
  *  - Implements dynamic script scraping for Vendor ID across Prod/Staging/Dev CDNs.
@@ -13,10 +19,14 @@
  */
 
 ;(function truyoConsentIntegration(window, document) {
+  var TIQ_GROUP_NAME = 'necessary';
+  var FALLBACK_PURPOSES = ['necessary', 'functionality', 'advertising', 'performance'];
+
   window.tealiumCmpIntegration = window.tealiumCmpIntegration || {};
 
   window.tealiumCmpIntegration.cmpName = 'Truyo';
-  window.tealiumCmpIntegration.cmpIntegrationVersion = 'truyo-1.0.0';
+  window.tealiumCmpIntegration.cmpIntegrationVersion = 'truyo-1.2.0';
+  window.tealiumCmpIntegration.tiqGroupName = window.tealiumCmpIntegration.tiqGroupName || TIQ_GROUP_NAME;
 
   // Attach framework methods
   window.tealiumCmpIntegration.cmpFetchCurrentConsentDecision = cmpFetchCurrentConsentDecision;
@@ -28,42 +38,50 @@
   window.tealiumCmpIntegration.cmpConvertResponseToGroupList = cmpConvertResponseToGroupList;
   window.tealiumCmpIntegration.cmpAddCallbackToTriggerRecheck = cmpAddCallbackToTriggerRecheck;
 
+  function getAllPurposes() {
+    var map = window.tealiumCmpIntegration.map;
+    var key = cmpFetchCurrentLookupKey();
+    return (map && map[key]) ? Object.keys(map[key]) : FALLBACK_PURPOSES;
+  }
+
   // 1. Operating Model
   function cmpCheckIfOptInModel() {
-    // [FUTURE UPDATE PREP]: Reads dynamic model if Truyo's future Geo API has completed
     if (window.truyoConfig && window.truyoConfig.geoLoaded && typeof window.truyoConfig.isOptInModel === 'boolean') {
       return window.truyoConfig.isOptInModel;
     }
-    
-    // [CURRENT DEFAULT]: Defaults to Opt-in to prevent illegal tracking in strict regions
-    // while waiting for the Truyo script to fully load.
-    return true; 
+    // Fail-safe default: Opt-in while geo is unresolved
+    return true;
   }
 
   // 2. Fetch Raw Decision from Truyo's Base64 LocalStorage
   function cmpFetchCurrentConsentDecision() {
     try {
       var raw = localStorage.getItem('truyoConsentOptOut');
-      if (!raw) return {};
-      return JSON.parse(atob(raw));
-    } catch (e) {
-      return {};
+      if (raw) {
+        var stored = JSON.parse(atob(raw));
+        if (stored && typeof stored === 'object') return stored;
+      }
+    } catch (e) {}
+
+    // US / Opt-out visitors with no stored choice get implicit consent (nothing opted out)
+    var cfg = window.truyoConfig;
+    if (cfg && cfg.geoLoaded === true && cfg.isOptInModel === false) {
+      return { optedOutCookiePurposes: [] };
     }
+
+    return {};
   }
 
-  // 3. Dynamic Key Scraper (Development, Staging, Production)
+  // 3. Dynamic Key Scraper (Dev, Staging, Prod)
   function cmpFetchCurrentLookupKey() {
     var scripts = document.getElementsByTagName('script');
     var re = /(?:truyoproductionuscdn|truyodevelopmentcdn|truyostagingcdn)\.truyo\.com\/js\/([a-f0-9]+)\.js/i;
 
     for (var i = 0; i < scripts.length; i++) {
       var match = re.exec(scripts[i].src);
-      if (match && match[1]) {
-        return match[1];
-      }
+      if (match && match[1]) return match[1];
     }
 
-    // Fallback: Reads Vendor ID directly from Tealium UI if script tag is obscured
     return (window.tealiumCmpIntegration &&
             window.tealiumCmpIntegration.map &&
             Object.keys(window.tealiumCmpIntegration.map)[0]) || 'truyo-default';
@@ -71,10 +89,9 @@
 
   // 4. Validate Decision Object
   function cmpCheckForWellFormedDecision(cmpRawOutput) {
-    // [FUTURE UPDATE PREP]: If Truyo signals that a Geo API lookup is currently in progress,
-    // return false to force Tealium to safely queue events and poll until the API finishes.
+    // Pause Tealium and keep polling while geo lookup is in flight
     if (window.truyoConfig && window.truyoConfig.geoLoaded === false) {
-        return false;
+      return false;
     }
 
     return typeof cmpRawOutput === 'object' &&
@@ -102,17 +119,7 @@
     if (!cmpCheckForWellFormedDecision(cmpRawOutput)) return [];
 
     var optedOutPurposes = cmpRawOutput.optedOutCookiePurposes || [];
-    var lookupKey = cmpFetchCurrentLookupKey();
-    var allConfiguredPurposes = [];
-
-    if (window.tealiumCmpIntegration.map && window.tealiumCmpIntegration.map[lookupKey]) {
-      allConfiguredPurposes = Object.keys(window.tealiumCmpIntegration.map[lookupKey]);
-    } else {
-      // Base fallback mapping using your specific category strings
-      allConfiguredPurposes = ['necessary', 'functional', 'advertising', 'performance'];
-    }
-
-    return allConfiguredPurposes.filter(function(purpose) {
+    return getAllPurposes().filter(function (purpose) {
       return optedOutPurposes.indexOf(purpose) === -1;
     });
   }
@@ -120,24 +127,23 @@
   // 7. Check TiQ Consent
   function cmpCheckForTiqConsent(cmpRawOutput, tiqGroupName) {
     if (!cmpCheckForWellFormedDecision(cmpRawOutput)) return false;
-    tiqGroupName = tiqGroupName || 'necessary';
-    var allowedGroups = cmpConvertResponseToGroupList(cmpRawOutput);
-    return allowedGroups.indexOf(tiqGroupName) !== -1;
+    tiqGroupName = tiqGroupName || TIQ_GROUP_NAME;
+    return cmpConvertResponseToGroupList(cmpRawOutput).indexOf(tiqGroupName) !== -1;
   }
 
-  // 8. Event Listener for Rechecks
+  // 8. Event Listeners for Rechecks
   function cmpAddCallbackToTriggerRecheck(triggerRecheck) {
     if (typeof triggerRecheck !== 'function') return;
-    document.addEventListener('truyoCookieSettingsUpdateEvent', function(e) {
-      // 150ms delay guarantees Truyo has finished updating LocalStorage and Cookies
-      // before Tealium attempts to read the new state.
-      setTimeout(function() {
-        triggerRecheck(e);
-      }, 150);
+
+    document.addEventListener('truyoCookieSettingsUpdateEvent', function (e) {
+      setTimeout(function () { triggerRecheck(e); }, 150);
+    });
+
+    document.addEventListener('truyoGeoResolved', function (e) {
+      triggerRecheck(e);
     });
   }
 })(window, document);
-
 /*
 // --- Debugging / Development Output ---
 // Repaste this entire template (including this block) into your browser console to test state changes
